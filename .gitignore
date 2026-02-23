@@ -1,0 +1,107 @@
+# ─── Mídia ───────────────────────────────────────────────────────
+*.mkv
+*.avi
+*.mp4
+*.m4v
+*.mov
+*.wmv
+*.flv
+*.webm
+*.ts
+*.m2ts
+*.vob
+*.ogv
+*.mpg
+*.mpeg
+
+# Legendas
+*.srt
+*.ass
+*.ssa
+*.sub
+*.idx
+*.vtt
+
+# Áudio
+*.mp3
+*.flac
+*.aac
+*.ogg
+*.wav
+*.wma
+*.m4a
+*.ac3
+*.dts
+
+# Imagens (thumbs, posters)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+
+# ─── macOS ───────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# ─── Windows ─────────────────────────────────────────────────────
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ─── Linux ───────────────────────────────────────────────────────
+*~
+.directory
+.Trash-*
+
+# ─── IDEs ────────────────────────────────────────────────────────
+# VSCode
+.vscode/
+*.code-workspace
+
+# JetBrains (IntelliJ, WebStorm, etc)
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Vim/Neovim
+*.swp
+*.swo
+*.swn
+[._]*.s[a-v][a-z]
+Session.vim
+.netrwhist
+tags
+
+# Emacs
+*~
+\#*\#
+.emacs.desktop
+*.elc
+auto-save-list
+tramp
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# ─── Diversos ───────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.orig
+.env
+.env.*
