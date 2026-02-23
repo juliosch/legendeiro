@@ -642,10 +642,13 @@ PROMPT_END
     local batch_input=""
     for (( i=batch_start; i<batch_end; i++ )); do
       local idx=$((i - batch_start + 1))
+      # Escapar \n do texto para \\n antes de montar o batch, para que o printf
+      # não expanda quebras internas do bloco como separadores de linhas do prompt
+      local escaped_text="${block_texts[$i]//\\n/\\\\n}"
       if [[ -n "$batch_input" ]]; then
-        batch_input="${batch_input}\n${idx}|||${block_texts[$i]}"
+        batch_input="${batch_input}\n${idx}|||${escaped_text}"
       else
-        batch_input="${idx}|||${block_texts[$i]}"
+        batch_input="${idx}|||${escaped_text}"
       fi
     done
 
@@ -678,7 +681,7 @@ PROMPT_END
       local count=$((batch_end - batch_start))
       for (( i=1; i<=count; i++ )); do
         local translated_line
-        translated_line=$(echo "$result" | grep -E "^${i}\|\|\|" | sed "s/^${i}|||//" || true)
+        translated_line=$(echo "$result" | awk -v n="${i}" '$0 ~ "^"n"[|][|][|]" && substr($0,1,length(n))+0==n+0 && substr($0,length(n)+1,1)=="|" {print substr($0,length(n)+4); exit}' || true)
         if [[ -z "$translated_line" ]]; then
           local orig_idx=$((batch_start + i - 1))
           translated_line="${block_texts[$orig_idx]}"
