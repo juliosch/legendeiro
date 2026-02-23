@@ -27,7 +27,7 @@ O prompt enviado ao LLM instrui uma **localização** (não apenas tradução li
 ## Uso
 
 ```bash
-./translate-srt.sh <caminho> <LLM_API_KEY> <OMDB_API_KEY> [opções]
+./legendeiro.sh <caminho> <LLM_API_KEY> <OMDB_API_KEY> [opções]
 ```
 
 | Argumento | Descrição |
@@ -49,22 +49,22 @@ O prompt enviado ao LLM instrui uma **localização** (não apenas tradução li
 
 ```bash
 # Traduzir todos os MKVs do diretório atual
-./translate-srt.sh . SUA_GEMINI_KEY SUA_OMDB_KEY
+./legendeiro.sh . SUA_GEMINI_KEY SUA_OMDB_KEY
 
 # Traduzir um arquivo específico
-./translate-srt.sh "video.mkv" SUA_GEMINI_KEY SUA_OMDB_KEY
+./legendeiro.sh "video.mkv" SUA_GEMINI_KEY SUA_OMDB_KEY
 
 # Usar OpenAI
-./translate-srt.sh ./series/ SUA_OPENAI_KEY SUA_OMDB_KEY --provider openai
+./legendeiro.sh ./series/ SUA_OPENAI_KEY SUA_OMDB_KEY --provider openai
 
 # Usar Claude
-./translate-srt.sh . SUA_ANTHROPIC_KEY SUA_OMDB_KEY --provider anthropic
+./legendeiro.sh . SUA_ANTHROPIC_KEY SUA_OMDB_KEY --provider anthropic
 
 # Usar Ollama (local, sem API key)
-./translate-srt.sh . none SUA_OMDB_KEY --provider ollama --model llama3.1
+./legendeiro.sh . none SUA_OMDB_KEY --provider ollama --model llama3.1
 
 # Forçar nome da série (útil quando o nome do arquivo é confuso)
-./translate-srt.sh . SUA_KEY SUA_OMDB_KEY --series "The 'Burbs"
+./legendeiro.sh . SUA_KEY SUA_OMDB_KEY --series "The 'Burbs"
 ```
 
 ## Providers suportados
