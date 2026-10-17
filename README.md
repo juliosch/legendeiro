@@ -10,8 +10,7 @@ O Legendeiro prioriza legendas em línguas românicas (espanhol, francês, itali
 2. **Pula arquivos** que já possuem legenda `.pt-BR.srt`
 3. **Detecta a melhor legenda disponível**, procurando primeiro por arquivos SRT externos e depois dentro do MKV, seguindo esta ordem de prioridade:
    - Espanhol latino > Espanhol > Português (PT) > Francês > Italiano > Romeno > Catalão > Alemão > Holandês > Russo > Polonês > Tcheco > Grego > Árabe > Inglês
-4. **Busca contexto da série no OMDB** (sinopse, elenco, gênero, info do episódio) para alimentar o LLM com contexto
-5. **Localiza as legendas** via LLM em batches, gerando um arquivo `.pt-BR.srt` ao lado do MKV original
+4. **Localiza as legendas** via LLM em batches, gerando um arquivo `.pt-BR.srt` ao lado do MKV original
 
 O prompt enviado ao LLM instrui uma **localização** (não apenas tradução literal), com linguagem coloquial brasileira e sem censura de palavrões (público 18+).
 
@@ -22,19 +21,17 @@ O prompt enviado ao LLM instrui uma **localização** (não apenas tradução li
 - **jq** (para montar/parsear JSON)
 - **curl**
 - Uma chave de API de LLM (ver [Providers suportados](#providers-suportados))
-- Uma chave de API do [OMDB](https://www.omdbapi.com/apikey.aspx) (gratuita, 1000 requests/dia)
 
 ## Uso
 
 ```bash
-./legendeiro.sh <caminho> <LLM_API_KEY> <OMDB_API_KEY> [opções]
+./legendeiro.sh <caminho> <LLM_API_KEY> [opções]
 ```
 
 | Argumento | Descrição |
 |-----------|-----------|
 | `caminho` | Arquivo `.mkv` ou diretório (busca recursiva) |
 | `LLM_API_KEY` | Chave da API do LLM (use `none` para Ollama) |
-| `OMDB_API_KEY` | Chave da API do OMDB |
 
 ### Opções
 
@@ -42,30 +39,44 @@ O prompt enviado ao LLM instrui uma **localização** (não apenas tradução li
 |------|-----------|
 | `--provider P` | Provider do LLM: `gemini`, `openai`, `anthropic`, `groq`, `ollama` (padrão: `gemini`) |
 | `--model M` | Modelo específico (se omitido, usa o padrão do provider) |
-| `--series "Nome"` | Nome da série para busca no OMDB (se omitido, extrai do nome do arquivo) |
 | `--source-lang X` | Forçar idioma de origem: `spa`, `eng`, `fre`, etc. (se omitido, auto-detecta) |
 
 ### Exemplos
 
 ```bash
 # Traduzir todos os MKVs do diretório atual
-./legendeiro.sh . SUA_GEMINI_KEY SUA_OMDB_KEY
+./legendeiro.sh . SUA_GEMINI_KEY
 
 # Traduzir um arquivo específico
-./legendeiro.sh "video.mkv" SUA_GEMINI_KEY SUA_OMDB_KEY
+./legendeiro.sh "video.mkv" SUA_GEMINI_KEY
 
 # Usar OpenAI
-./legendeiro.sh ./series/ SUA_OPENAI_KEY SUA_OMDB_KEY --provider openai
+./legendeiro.sh ./series/ SUA_OPENAI_KEY --provider openai
 
 # Usar Claude
-./legendeiro.sh . SUA_ANTHROPIC_KEY SUA_OMDB_KEY --provider anthropic
+./legendeiro.sh . SUA_ANTHROPIC_KEY --provider anthropic
 
 # Usar Ollama (local, sem API key)
-./legendeiro.sh . none SUA_OMDB_KEY --provider ollama --model llama3.1
-
-# Forçar nome da série (útil quando o nome do arquivo é confuso)
-./legendeiro.sh . SUA_KEY SUA_OMDB_KEY --series "The 'Burbs"
+./legendeiro.sh . none --provider ollama --model llama3.1
 ```
+
+## Usando no Claude Code (sem API key)
+
+O repo inclui a skill `/legendar`: o próprio Claude Code faz a localização, então não precisa de API key. Com o Claude Code aberto nesta pasta:
+
+```
+/legendar ~/Series/Minha.Serie/S01/
+/legendar "video.mkv"
+```
+
+A skill usa o modo lotes do script, que não chama nenhum LLM:
+
+```bash
+./legendeiro.sh prepare video.mkv   # extrai a legenda e divide em lotes "N|||texto"; imprime WORKDIR
+./legendeiro.sh finish <WORKDIR>    # valida os lote_*.ptbr.txt e gera video.pt-BR.srt
+```
+
+Entre os dois passos, o Claude escreve um contexto da série em `.legendeiro-work/contexto-<serie>.md` (personagens e gênero, tom, tratamento, glossário), reaproveitado nos episódios seguintes, e localiza o episódio inteiro seguindo `.claude/skills/legendar/regras.md`. Um episódio é traduzido pela sessão principal. Numa pasta com vários episódios, cada episódio vai para um subagente, em paralelo. O `finish` não deixa passar nenhum bloco sem tradução.
 
 ## Providers suportados
 

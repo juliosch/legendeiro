@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # ─── Configuração ───────────────────────────────────────────────
-BATCH_SIZE=40        # blocos SRT por request
+BATCH_SIZE=40        # blocos SRT por request (modo API)
+LOTE_SIZE=150        # blocos SRT por lote (modo prepare/finish)
 # ────────────────────────────────────────────────────────────────
 
 # ─── Modelos padrão por provider ────────────────────────────────
@@ -19,17 +20,23 @@ default_model_for() {
 
 usage() {
   cat <<EOF
-Uso: $0 <caminho> <LLM_API_KEY> <OMDB_API_KEY> [opções]
+Uso: $0 <caminho> <LLM_API_KEY> [opções]
+     $0 prepare <arquivo.mkv> [--source-lang X]
+     $0 finish <workdir>
 
+Modo API (padrão): traduz via LLM e gera o .pt-BR.srt.
   caminho        - Arquivo MKV ou diretório (busca recursiva por .mkv)
   LLM_API_KEY    - Chave de API do LLM (use "none" para ollama)
-  OMDB_API_KEY   - Chave de API do OMDB (grátis em omdbapi.com)
+
+Modo lotes (sem LLM, usado pela skill /legendar do Claude Code):
+  prepare        - Extrai a melhor legenda e divide em lotes "N|||texto"
+                   num diretório de trabalho (impresso como WORKDIR: ...)
+  finish         - Lê os lote_*.ptbr.txt do workdir e gera o .pt-BR.srt
 
 Opções:
   --provider P     - Provider do LLM (padrão: gemini)
                      Opções: gemini, openai, anthropic, groq, ollama
   --model M        - Modelo específico (se omitido, usa o padrão do provider)
-  --series "Nome"  - Nome da série (se omitido, extrai do nome do arquivo)
   --source-lang X  - Idioma de origem: spa, eng, etc (padrão: auto-detecta)
 
 Providers e modelos padrão:
@@ -40,81 +47,16 @@ Providers e modelos padrão:
   ollama     →  $(default_model_for ollama)
 
 Exemplos:
-  $0 ./videos/ GEMINI_KEY OMDB_KEY
-  $0 video.mkv GEMINI_KEY OMDB_KEY
-  $0 ./series/ OPENAI_KEY OMDB_KEY --provider openai
-  $0 . none OMDB_KEY --provider ollama --model llama3.1
+  $0 ./videos/ GEMINI_KEY
+  $0 video.mkv GEMINI_KEY
+  $0 ./series/ OPENAI_KEY --provider openai
+  $0 . none --provider ollama --model llama3.1
+  $0 prepare video.mkv
 EOF
-  exit 1
+  exit 2
 }
 
-# ─── Parsear argumentos ─────────────────────────────────────────
-[[ $# -lt 3 ]] && usage
-
-INPUT_PATH="$1"
-LLM_KEY="$2"
-OMDB_KEY="$3"
-shift 3
-
-PROVIDER="gemini"
-MODEL=""
-ARG_SERIES_NAME=""
 ARG_SOURCE_LANG=""
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --provider)
-      PROVIDER="$2"
-      shift 2
-      ;;
-    --model)
-      MODEL="$2"
-      shift 2
-      ;;
-    --series)
-      ARG_SERIES_NAME="$2"
-      shift 2
-      ;;
-    --source-lang)
-      ARG_SOURCE_LANG="$2"
-      shift 2
-      ;;
-    *)
-      echo "Opção desconhecida: $1"
-      usage
-      ;;
-  esac
-done
-
-# Validar provider
-case "$PROVIDER" in
-  gemini|openai|anthropic|groq|ollama) ;;
-  *)
-    echo "Erro: provider '$PROVIDER' não suportado."
-    echo "Opções: gemini, openai, anthropic, groq, ollama"
-    exit 1
-    ;;
-esac
-
-# Definir modelo se não especificado
-if [[ -z "$MODEL" ]]; then
-  MODEL=$(default_model_for "$PROVIDER")
-fi
-
-# Validar input
-if [[ ! -f "$INPUT_PATH" && ! -d "$INPUT_PATH" ]]; then
-  echo "Erro: '$INPUT_PATH' não encontrado."
-  exit 1
-fi
-
-echo "Provider: $PROVIDER | Modelo: $MODEL"
-echo ""
-
-# ─── Contadores globais ─────────────────────────────────────────
-COUNT_TOTAL=0
-COUNT_TRANSLATED=0
-COUNT_SKIPPED=0
-COUNT_ERRORS=0
 
 # ─── Mapa de idiomas ────────────────────────────────────────────
 get_lang_name() {
@@ -253,29 +195,6 @@ call_llm() {
   esac
 }
 
-# ─── Extrair nome da série do arquivo ────────────────────────────
-extract_series_name() {
-  local filename
-  filename="$(basename "$1")"
-  filename="${filename%.*}"
-
-  local name
-  if [[ "$filename" =~ ^(.+)[.\ ][Ss][0-9]+[Ee][0-9]+ ]]; then
-    name="${BASH_REMATCH[1]}"
-  elif [[ "$filename" =~ ^(.+)[.\ ][0-9]+[xX][0-9]+ ]]; then
-    name="${BASH_REMATCH[1]}"
-  else
-    name=$(echo "$filename" | sed -E 's/[. ](19|20)[0-9]{2}.*//')
-  fi
-
-  name="${name//\./ }"
-  name="${name//_/ }"
-  name=$(echo "$name" | sed -E 's/ *(19|20)[0-9]{2} *$//')
-  name=$(echo "$name" | sed 's/  */ /g; s/^ *//; s/ *$//')
-
-  echo "$name"
-}
-
 # ─── Sufixos SRT por idioma ─────────────────────────────────────
 get_srt_suffixes() {
   case "$1" in
@@ -322,154 +241,44 @@ find_external_srt() {
   return 1
 }
 
-# ─── Buscar contexto no OMDB ────────────────────────────────────
-# Cache: evita buscar a mesma série múltiplas vezes
-OMDB_CACHE_SERIES=""
-OMDB_CACHE_CONTEXT=""
-
-fetch_omdb_context() {
-  local search_name="$1"
-  local season="${2:-}"
-  local episode="${3:-}"
-
-  # Se já buscou essa série, usar cache (só atualiza episódio)
-  if [[ "$search_name" == "$OMDB_CACHE_SERIES" && -n "$OMDB_CACHE_CONTEXT" ]]; then
-    SERIES_CONTEXT="$OMDB_CACHE_CONTEXT"
-    # Buscar info do episódio se mudou
-    if [[ -n "$season" && -n "$episode" ]]; then
-      local title
-      title=$(echo "$SERIES_CONTEXT" | head -1 | sed 's/.*"\(.*\)".*/\1/')
-      local ep_response
-      ep_response=$(curl -s "https://www.omdbapi.com/?t=$(jq -rn --arg s "$title" '$s|@uri')&Season=${season}&Episode=${episode}&apikey=${OMDB_KEY}" 2>/dev/null)
-      local ep_title
-      ep_title=$(echo "$ep_response" | jq -r '.Title // empty' 2>/dev/null)
-      local ep_plot
-      ep_plot=$(echo "$ep_response" | jq -r '.Plot // empty' 2>/dev/null)
-      if [[ -n "$ep_title" && "$ep_title" != "null" ]]; then
-        echo "  Episódio: S${season}E${episode} - $ep_title"
-      fi
-      # Remover episódio anterior do contexto e adicionar o novo
-      SERIES_CONTEXT=$(echo "$SERIES_CONTEXT" | grep -v "^Episódio atual")
-      if [[ -n "$ep_plot" && "$ep_plot" != "N/A" && "$ep_plot" != "null" ]]; then
-        SERIES_CONTEXT="${SERIES_CONTEXT}
-Episódio atual (S${season}E${episode}): ${ep_plot}"
-      fi
-    fi
-    return 0
-  fi
-
-  local encoded_name
-  encoded_name=$(jq -rn --arg s "$search_name" '$s|@uri')
-
-  local series_response
-  series_response=$(curl -s "https://www.omdbapi.com/?t=${encoded_name}&type=series&apikey=${OMDB_KEY}" 2>/dev/null)
-
-  local omdb_response
-  omdb_response=$(echo "$series_response" | jq -r '.Response // "False"' 2>/dev/null)
-
-  if [[ "$omdb_response" != "True" ]]; then
-    echo "  Busca por título exato falhou. Tentando busca por pesquisa..." >&2
-    local search_results
-    search_results=$(curl -s "https://www.omdbapi.com/?s=${encoded_name}&type=series&apikey=${OMDB_KEY}" 2>/dev/null)
-    local first_id
-    first_id=$(echo "$search_results" | jq -r '.Search[0].imdbID // empty' 2>/dev/null)
-    if [[ -z "$first_id" ]]; then
-      echo "  Aviso: série \"${search_name}\" não encontrada no OMDB." >&2
-      return 1
-    fi
-    series_response=$(curl -s "https://www.omdbapi.com/?i=${first_id}&plot=full&apikey=${OMDB_KEY}" 2>/dev/null)
-  fi
-
-  local title genre plot actors
-  title=$(echo "$series_response" | jq -r '.Title // empty')
-  genre=$(echo "$series_response" | jq -r '.Genre // empty')
-  plot=$(echo "$series_response" | jq -r '.Plot // empty')
-  actors=$(echo "$series_response" | jq -r '.Actors // empty')
-
-  echo "  Série encontrada: $title"
-  echo "  Gênero: $genre"
-
-  SERIES_CONTEXT="CONTEXTO DA SÉRIE:
-\"${title}\" é uma série de ${genre}.
-Sinopse: ${plot}
-Elenco principal: ${actors}"
-
-  # Cache da série
-  OMDB_CACHE_SERIES="$search_name"
-  OMDB_CACHE_CONTEXT="$SERIES_CONTEXT"
-
-  # Buscar episódio
-  if [[ -n "$season" && -n "$episode" ]]; then
-    local ep_response
-    ep_response=$(curl -s "https://www.omdbapi.com/?t=$(jq -rn --arg s "$title" '$s|@uri')&Season=${season}&Episode=${episode}&apikey=${OMDB_KEY}" 2>/dev/null)
-    local ep_title
-    ep_title=$(echo "$ep_response" | jq -r '.Title // empty' 2>/dev/null)
-    local ep_plot
-    ep_plot=$(echo "$ep_response" | jq -r '.Plot // empty' 2>/dev/null)
-    if [[ -n "$ep_title" && "$ep_title" != "null" ]]; then
-      echo "  Episódio: S${season}E${episode} - $ep_title"
-    fi
-    if [[ -n "$ep_plot" && "$ep_plot" != "N/A" && "$ep_plot" != "null" ]]; then
-      SERIES_CONTEXT="${SERIES_CONTEXT}
-Episódio atual (S${season}E${episode}): ${ep_plot}"
-    fi
-  fi
-
-  return 0
+# ─── Buscar stream de legenda por idioma no MKV ────────────────
+find_stream_by_lang() {
+  awk -F, -v lang="$2" '$2 == lang { print $1; exit }' <<< "$1"
 }
 
 # ─── Prioridade de idiomas ──────────────────────────────────────
 LANG_PRIORITY=(spa-lat spa por fre ita ron cat ger dut rus pol cze gre ara eng)
 
-# ════════════════════════════════════════════════════════════════
-# ─── PROCESSAR UM ARQUIVO MKV ──────────────────────────────────
-# ════════════════════════════════════════════════════════════════
-process_file() {
+# ─── Checar se já existe PT-BR ──────────────────────────────────
+# Retorna 0 (e imprime o caminho) se já existir legenda PT-BR
+find_existing_ptbr() {
   local mkv_file="$1"
+  local base="${mkv_file%.*}"
+  local ptbr_patterns="pt-BR pt-br pt_BR pt_br ptbr por.br brazilian"
+  for suffix in $ptbr_patterns; do
+    for candidate in "${base}.${suffix}.srt" "${base}.${suffix}.SRT"; do
+      if [[ -f "$candidate" ]]; then
+        echo "$candidate"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+# ─── Buscar melhor legenda de origem ────────────────────────────
+# Copia/extrai a legenda escolhida para $2 e define SOURCE_LANG_NAME.
+# Retorna 2 se nenhuma legenda for encontrada.
+find_source_srt() {
+  local mkv_file="$1"
+  local dest="$2"
   local basename
   basename="$(basename "${mkv_file%.*}")"
   local mkv_dir
   mkv_dir="$(dirname "$mkv_file")"
-  local srt_ptbr="${mkv_file%.*}.pt-BR.srt"
 
-  # ── Checar se já existe PT-BR ──
-  local ptbr_patterns="pt-BR pt-br pt_BR pt_br ptbr por.br brazilian"
-  for suffix in $ptbr_patterns; do
-    for candidate in "${mkv_dir}/${basename}.${suffix}.srt" "${mkv_dir}/${basename}.${suffix}.SRT"; do
-      if [[ -f "$candidate" ]]; then
-        echo "  SKIP: PT-BR já existe ($candidate)"
-        return 1
-      fi
-    done
-  done
-  if [[ -f "$srt_ptbr" ]]; then
-    echo "  SKIP: PT-BR já existe ($srt_ptbr)"
-    return 1
-  fi
-
-  # ── Detectar série e episódio ──
-  local series_name="$ARG_SERIES_NAME"
-  if [[ -z "$series_name" ]]; then
-    series_name=$(extract_series_name "$mkv_file")
-  fi
-
-  local season="" episode=""
-  local basename_file
-  basename_file="$(basename "$mkv_file")"
-  if [[ "$basename_file" =~ [Ss]([0-9]+)[Ee]([0-9]+) ]]; then
-    season="${BASH_REMATCH[1]#0}"
-    episode="${BASH_REMATCH[2]#0}"
-  fi
-
-  # ── OMDB ──
-  echo "  Buscando contexto OMDB..."
-  SERIES_CONTEXT=""
-  fetch_omdb_context "$series_name" "$season" "$episode" || true
-
-  # ── Buscar fonte de legenda ──
   local srt_orig=""
   local source_lang="${ARG_SOURCE_LANG}"
-  local source_lang_name=""
 
   # Tentar SRT externo
   if [[ -n "$source_lang" ]]; then
@@ -486,69 +295,66 @@ process_file() {
   fi
 
   if [[ -n "$srt_orig" ]]; then
-    source_lang_name=$(get_lang_name "$source_lang")
-    echo "  SRT externo: ${source_lang_name} ($srt_orig)"
-  else
-    # Extrair do MKV
-    echo "  Buscando legendas dentro do MKV..."
+    SOURCE_LANG_NAME=$(get_lang_name "$source_lang")
+    echo "  SRT externo: ${SOURCE_LANG_NAME} ($srt_orig)"
+    cp "$srt_orig" "$dest"
+    return 0
+  fi
 
-    local sub_index=""
-    local all_subs_full
-    all_subs_full=$(ffprobe -v error -select_streams s \
-      -show_entries stream=index:stream_tags=language,title \
-      -of csv=p=0 "$mkv_file" 2>/dev/null)
+  # Extrair do MKV
+  echo "  Buscando legendas dentro do MKV..."
 
-    local all_subs
-    all_subs=$(ffprobe -v error -select_streams s \
-      -show_entries stream=index:stream_tags=language \
-      -of csv=p=0 "$mkv_file" 2>/dev/null)
+  local sub_index=""
+  # Uma linha por stream: index,language[,title]
+  local all_subs
+  all_subs=$(ffprobe -v error -select_streams s \
+    -show_entries stream=index:stream_tags=language,title \
+    -of csv=p=0 "$mkv_file" 2>/dev/null)
 
-    if [[ -n "$source_lang" && "$source_lang" != "spa-lat" ]]; then
-      sub_index=$(echo "$all_subs" | grep ",${source_lang}" | head -1 | cut -d',' -f1 || true)
-    fi
+  if [[ -n "$source_lang" && "$source_lang" != "spa-lat" ]]; then
+    sub_index=$(find_stream_by_lang "$all_subs" "$source_lang")
+  fi
 
-    if [[ -z "$sub_index" ]]; then
-      for lang in "${LANG_PRIORITY[@]}"; do
-        if [[ "$lang" == "spa-lat" ]]; then
-          sub_index=$(echo "$all_subs_full" | grep -i ",spa," | grep -iE "latin|latino|latam|la\b|latinoam|MX|mexico|méxico|américa" | head -1 | cut -d',' -f1 || true)
-          if [[ -n "$sub_index" ]]; then
-            source_lang="spa"
-            echo "  Encontrada legenda em espanhol latino!"
-            break
-          fi
-        else
-          sub_index=$(echo "$all_subs" | grep ",${lang}" | head -1 | cut -d',' -f1 || true)
-          if [[ -n "$sub_index" ]]; then
-            source_lang="$lang"
-            break
-          fi
+  if [[ -z "$sub_index" ]]; then
+    for lang in "${LANG_PRIORITY[@]}"; do
+      if [[ "$lang" == "spa-lat" ]]; then
+        sub_index=$(echo "$all_subs" | grep -i ",spa," | grep -iE "latin|latino|latam|la\b|latinoam|MX|mexico|méxico|américa" | head -1 | cut -d',' -f1 || true)
+        if [[ -n "$sub_index" ]]; then
+          source_lang="spa"
+          echo "  Encontrada legenda em espanhol latino!"
+          break
         fi
-      done
-    fi
-
-    if [[ -z "$sub_index" ]]; then
-      echo "  ERRO: nenhuma legenda encontrada."
-      return 2
-    fi
-
-    source_lang_name=$(get_lang_name "$source_lang")
-    echo "  MKV stream $sub_index: ${source_lang_name}"
-
-    srt_orig="/tmp/${basename}.orig.srt"
-    ffmpeg -v error -y -i "$mkv_file" -map "0:${sub_index}" -c:s srt "$srt_orig"
+      else
+        sub_index=$(find_stream_by_lang "$all_subs" "$lang")
+        if [[ -n "$sub_index" ]]; then
+          source_lang="$lang"
+          break
+        fi
+      fi
+    done
   fi
 
-  # Garantir nome do idioma
-  if [[ -z "$source_lang_name" ]]; then
-    source_lang_name=$(get_lang_name "${source_lang:-eng}")
+  if [[ -z "$sub_index" ]]; then
+    echo "  ERRO: nenhuma legenda encontrada."
+    return 2
   fi
 
-  # ── Parsear SRT ──
-  local block_nums=()
-  local block_times=()
-  local block_texts=()
+  SOURCE_LANG_NAME=$(get_lang_name "$source_lang")
+  echo "  MKV stream $sub_index: ${SOURCE_LANG_NAME}"
+
+  ffmpeg -v error -y -i "$mkv_file" -map "0:${sub_index}" -c:s srt "$dest"
+}
+
+# ─── Parsear SRT ────────────────────────────────────────────────
+# Preenche BLOCK_NUMS, BLOCK_TIMES e BLOCK_TEXTS (quebras de linha
+# dentro de um bloco viram o literal \n)
+parse_srt() {
+  BLOCK_NUMS=()
+  BLOCK_TIMES=()
+  BLOCK_TEXTS=()
   local current_num="" current_time="" current_text=""
   local state="num"
+  local line
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line#$'\xef\xbb\xbf'}"
@@ -565,9 +371,9 @@ process_file() {
       state="text"
     elif [[ "$state" == "text" ]]; then
       if [[ -z "$line" ]]; then
-        block_nums+=("$current_num")
-        block_times+=("$current_time")
-        block_texts+=("$current_text")
+        BLOCK_NUMS+=("$current_num")
+        BLOCK_TIMES+=("$current_time")
+        BLOCK_TEXTS+=("$current_text")
         state="num"
       else
         if [[ -n "$current_text" ]]; then
@@ -577,29 +383,58 @@ process_file() {
         fi
       fi
     fi
-  done < "$srt_orig"
+  done < "$1"
 
   if [[ "$state" == "text" && -n "$current_text" ]]; then
-    block_nums+=("$current_num")
-    block_times+=("$current_time")
-    block_texts+=("$current_text")
+    BLOCK_NUMS+=("$current_num")
+    BLOCK_TIMES+=("$current_time")
+    BLOCK_TEXTS+=("$current_text")
+  fi
+}
+
+# ─── Gerar SRT ──────────────────────────────────────────────────
+# Usa BLOCK_NUMS/BLOCK_TIMES com os textos de TRANSLATED_TEXTS
+write_srt() {
+  local total_blocks=${#BLOCK_NUMS[@]}
+  {
+    for (( i=0; i<total_blocks; i++ )); do
+      echo "${BLOCK_NUMS[$i]}"
+      echo "${BLOCK_TIMES[$i]}"
+      echo -e "${TRANSLATED_TEXTS[$i]}"
+      echo ""
+    done
+  } > "$1"
+}
+
+# ════════════════════════════════════════════════════════════════
+# ─── MODO API: PROCESSAR UM ARQUIVO MKV ────────────────────────
+# ════════════════════════════════════════════════════════════════
+process_file() {
+  local mkv_file="$1"
+  local basename
+  basename="$(basename "${mkv_file%.*}")"
+  local srt_ptbr="${mkv_file%.*}.pt-BR.srt"
+
+  local existing
+  if existing=$(find_existing_ptbr "$mkv_file"); then
+    echo "  SKIP: PT-BR já existe ($existing)"
+    return 1
   fi
 
-  local total_blocks=${#block_nums[@]}
+  local srt_orig="${TMP_DIR}/${basename}.orig.srt"
+  find_source_srt "$mkv_file" "$srt_orig" || return 2
+  local source_lang_name="$SOURCE_LANG_NAME"
+
+  parse_srt "$srt_orig"
+  local total_blocks=${#BLOCK_NUMS[@]}
   echo "  Blocos: $total_blocks | Idioma: ${source_lang_name}"
 
   # ── Montar prompt ──
-  local context_block=""
-  if [[ -n "$SERIES_CONTEXT" ]]; then
-    context_block="
-${SERIES_CONTEXT}
-"
-  fi
 
   local prompt_template
   prompt_template=$(cat <<PROMPT_END
 Você é um localizador profissional de legendas para o mercado brasileiro.
-${context_block}
+
 TAREFA:
 Localize (não apenas traduza) as legendas abaixo de ${source_lang_name} para português brasileiro (PT-BR).
 
@@ -626,7 +461,7 @@ PROMPT_END
 )
 
   # ── Traduzir em batches ──
-  local translated_texts=()
+  TRANSLATED_TEXTS=()
   local total_batches=$(( (total_blocks + BATCH_SIZE - 1) / BATCH_SIZE ))
 
   for (( batch_start=0; batch_start<total_blocks; batch_start+=BATCH_SIZE )); do
@@ -644,7 +479,7 @@ PROMPT_END
       local idx=$((i - batch_start + 1))
       # Escapar \n do texto para \\n antes de montar o batch, para que o printf
       # não expanda quebras internas do bloco como separadores de linhas do prompt
-      local escaped_text="${block_texts[$i]//\\n/\\\\n}"
+      local escaped_text="${BLOCK_TEXTS[$i]//\\n/\\\\n}"
       if [[ -n "$batch_input" ]]; then
         batch_input="${batch_input}\n${idx}|||${escaped_text}"
       else
@@ -684,10 +519,10 @@ PROMPT_END
         translated_line=$(echo "$result" | awk -v n="${i}" '$0 ~ "^"n"[|][|][|]" && substr($0,1,length(n))+0==n+0 && substr($0,length(n)+1,1)=="|" {print substr($0,length(n)+4); exit}' || true)
         if [[ -z "$translated_line" ]]; then
           local orig_idx=$((batch_start + i - 1))
-          translated_line="${block_texts[$orig_idx]}"
+          translated_line="${BLOCK_TEXTS[$orig_idx]}"
           echo "    Aviso: bloco $i não encontrado, mantendo original" >&2
         fi
-        translated_texts+=("$translated_line")
+        TRANSLATED_TEXTS+=("$translated_line")
       done
       batch_ok=true
       break
@@ -696,7 +531,7 @@ PROMPT_END
     if [[ "$batch_ok" != true ]]; then
       echo "    FALHA: mantendo originais para este batch" >&2
       for (( i=batch_start; i<batch_end; i++ )); do
-        translated_texts+=("${block_texts[$i]}")
+        TRANSLATED_TEXTS+=("${BLOCK_TEXTS[$i]}")
       done
     fi
 
@@ -706,65 +541,246 @@ PROMPT_END
     fi
   done
 
-  # ── Gerar SRT ──
-  {
-    for (( i=0; i<total_blocks; i++ )); do
-      echo "${block_nums[$i]}"
-      echo "${block_times[$i]}"
-      echo -e "${translated_texts[$i]}"
-      echo ""
-    done
-  } > "$srt_ptbr"
-
+  write_srt "$srt_ptbr"
   echo "  OK: $srt_ptbr ($total_blocks blocos)"
   return 0
 }
 
-# ════════════════════════════════════════════════════════════════
-# ─── DESCOBRIR ARQUIVOS E PROCESSAR ────────────────────────────
-# ════════════════════════════════════════════════════════════════
+main_api() {
+  [[ $# -lt 2 ]] && usage
 
-# Construir lista de MKVs
-MKV_FILES=()
+  INPUT_PATH="$1"
+  LLM_KEY="$2"
+  shift 2
 
-if [[ -f "$INPUT_PATH" ]]; then
-  MKV_FILES+=("$INPUT_PATH")
-elif [[ -d "$INPUT_PATH" ]]; then
-  while IFS= read -r -d '' file; do
-    MKV_FILES+=("$file")
-  done < <(find "$INPUT_PATH" -type f -iname "*.mkv" -print0 | sort -z)
-fi
+  PROVIDER="gemini"
+  MODEL=""
 
-if [[ ${#MKV_FILES[@]} -eq 0 ]]; then
-  echo "Nenhum arquivo MKV encontrado em '$INPUT_PATH'."
-  exit 1
-fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider)
+        PROVIDER="$2"
+        shift 2
+        ;;
+      --model)
+        MODEL="$2"
+        shift 2
+        ;;
+      --source-lang)
+        ARG_SOURCE_LANG="$2"
+        shift 2
+        ;;
+      *)
+        echo "Opção desconhecida: $1"
+        usage
+        ;;
+    esac
+  done
 
-echo "Encontrados ${#MKV_FILES[@]} arquivo(s) MKV."
-echo "════════════════════════════════════════════════════════════"
-echo ""
-
-for mkv_file in "${MKV_FILES[@]}"; do
-  COUNT_TOTAL=$((COUNT_TOTAL + 1))
-  echo "[$COUNT_TOTAL/${#MKV_FILES[@]}] $(basename "$mkv_file")"
-
-  result=0
-  process_file "$mkv_file" || result=$?
-
-  case $result in
-    0) COUNT_TRANSLATED=$((COUNT_TRANSLATED + 1)) ;;
-    1) COUNT_SKIPPED=$((COUNT_SKIPPED + 1)) ;;
-    *) COUNT_ERRORS=$((COUNT_ERRORS + 1)) ;;
+  # Validar provider
+  case "$PROVIDER" in
+    gemini|openai|anthropic|groq|ollama) ;;
+    *)
+      echo "Erro: provider '$PROVIDER' não suportado."
+      echo "Opções: gemini, openai, anthropic, groq, ollama"
+      exit 1
+      ;;
   esac
 
-  echo ""
-done
+  # Definir modelo se não especificado
+  if [[ -z "$MODEL" ]]; then
+    MODEL=$(default_model_for "$PROVIDER")
+  fi
 
-# ─── Resumo final ───────────────────────────────────────────────
-echo "════════════════════════════════════════════════════════════"
-echo "RESUMO"
-echo "  Total:      $COUNT_TOTAL"
-echo "  Traduzidos: $COUNT_TRANSLATED"
-echo "  Pulados:    $COUNT_SKIPPED (PT-BR já existia)"
-echo "  Erros:      $COUNT_ERRORS"
-echo "════════════════════════════════════════════════════════════"
+  # Validar input
+  if [[ ! -f "$INPUT_PATH" && ! -d "$INPUT_PATH" ]]; then
+    echo "Erro: '$INPUT_PATH' não encontrado."
+    exit 1
+  fi
+
+  echo "Provider: $PROVIDER | Modelo: $MODEL"
+  echo ""
+
+  # Diretório temporário (legendas extraídas do MKV)
+  TMP_DIR=$(mktemp -d)
+  trap 'rm -rf "$TMP_DIR"' EXIT
+
+  # Construir lista de MKVs
+  local mkv_files=()
+
+  if [[ -f "$INPUT_PATH" ]]; then
+    mkv_files+=("$INPUT_PATH")
+  elif [[ -d "$INPUT_PATH" ]]; then
+    while IFS= read -r -d '' file; do
+      mkv_files+=("$file")
+    done < <(find "$INPUT_PATH" -type f -iname "*.mkv" -print0 | sort -z)
+  fi
+
+  if [[ ${#mkv_files[@]} -eq 0 ]]; then
+    echo "Nenhum arquivo MKV encontrado em '$INPUT_PATH'."
+    exit 1
+  fi
+
+  echo "Encontrados ${#mkv_files[@]} arquivo(s) MKV."
+  echo "════════════════════════════════════════════════════════════"
+  echo ""
+
+  local count_total=0 count_translated=0 count_skipped=0 count_errors=0
+
+  for mkv_file in "${mkv_files[@]}"; do
+    count_total=$((count_total + 1))
+    echo "[$count_total/${#mkv_files[@]}] $(basename "$mkv_file")"
+
+    local result=0
+    process_file "$mkv_file" || result=$?
+
+    case $result in
+      0) count_translated=$((count_translated + 1)) ;;
+      1) count_skipped=$((count_skipped + 1)) ;;
+      *) count_errors=$((count_errors + 1)) ;;
+    esac
+
+    echo ""
+  done
+
+  # Resumo final
+  echo "════════════════════════════════════════════════════════════"
+  echo "RESUMO"
+  echo "  Total:      $count_total"
+  echo "  Traduzidos: $count_translated"
+  echo "  Pulados:    $count_skipped (PT-BR já existia)"
+  echo "  Erros:      $count_errors"
+  echo "════════════════════════════════════════════════════════════"
+}
+
+# ════════════════════════════════════════════════════════════════
+# ─── MODO LOTES: PREPARE / FINISH ──────────────────────────────
+# ════════════════════════════════════════════════════════════════
+# Códigos de saída: 0 = ok, 1 = pulado (PT-BR já existe), 2 = erro
+
+cmd_prepare() {
+  [[ $# -lt 1 ]] && usage
+  local mkv_file="$1"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --source-lang)
+        ARG_SOURCE_LANG="$2"
+        shift 2
+        ;;
+      *)
+        echo "Opção desconhecida: $1"
+        usage
+        ;;
+    esac
+  done
+
+  if [[ ! -f "$mkv_file" ]]; then
+    echo "Erro: '$mkv_file' não encontrado."
+    exit 2
+  fi
+
+  local existing
+  if existing=$(find_existing_ptbr "$mkv_file"); then
+    echo "SKIP: PT-BR já existe ($existing)"
+    exit 1
+  fi
+
+  # LEGENDEIRO_WORK define onde ficam os workdirs (padrão: $TMPDIR)
+  local work_base="${LEGENDEIRO_WORK:-${TMPDIR:-/tmp}}"
+  mkdir -p "$work_base"
+  work_base=$(cd "$work_base" && pwd)
+  local workdir
+  workdir=$(mktemp -d "${work_base%/}/legendeiro.XXXXXX")
+
+  if ! find_source_srt "$mkv_file" "$workdir/source.srt"; then
+    rm -rf "$workdir"
+    exit 2
+  fi
+
+  parse_srt "$workdir/source.srt"
+  local total_blocks=${#BLOCK_NUMS[@]}
+  if (( total_blocks == 0 )); then
+    echo "  ERRO: legenda de origem vazia."
+    rm -rf "$workdir"
+    exit 2
+  fi
+
+  # Lotes com numeração global (1..total), mesmo formato do modo API
+  local lotes=0
+  for (( start=0; start<total_blocks; start+=LOTE_SIZE )); do
+    lotes=$((lotes + 1))
+    local lote_file
+    lote_file=$(printf '%s/lote_%03d.txt' "$workdir" "$lotes")
+    for (( i=start; i<start+LOTE_SIZE && i<total_blocks; i++ )); do
+      printf '%s|||%s\n' "$((i + 1))" "${BLOCK_TEXTS[$i]}"
+    done > "$lote_file"
+  done
+
+  printf 'MKV_FILE=%q\nSRT_PTBR=%q\nSOURCE_LANG_NAME=%q\nLOTE_SIZE=%q\n' \
+    "$mkv_file" "${mkv_file%.*}.pt-BR.srt" "$SOURCE_LANG_NAME" "$LOTE_SIZE" > "$workdir/meta"
+
+  echo "  Blocos: $total_blocks | Idioma: ${SOURCE_LANG_NAME} | Lotes: $lotes"
+  echo "WORKDIR: $workdir"
+}
+
+cmd_finish() {
+  [[ $# -ne 1 ]] && usage
+  local workdir="$1"
+
+  if [[ ! -f "$workdir/meta" || ! -f "$workdir/source.srt" ]]; then
+    echo "Erro: '$workdir' não é um diretório de trabalho do prepare."
+    exit 2
+  fi
+  # shellcheck source=/dev/null
+  source "$workdir/meta"
+
+  parse_srt "$workdir/source.srt"
+  local total_blocks=${#BLOCK_NUMS[@]}
+
+  TRANSLATED_TEXTS=()
+  local re='^([0-9]+)[|][|][|](.*)$'
+  local f line n
+  for f in "$workdir"/lote_*.ptbr.txt; do
+    [[ -f "$f" ]] || continue
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      if [[ "$line" =~ $re ]]; then
+        n=$((10#${BASH_REMATCH[1]}))
+        if (( n >= 1 && n <= total_blocks )) && [[ -n "${BASH_REMATCH[2]}" ]]; then
+          TRANSLATED_TEXTS[$((n - 1))]="${BASH_REMATCH[2]}"
+        fi
+      fi
+    done < "$f"
+  done
+
+  # Validar: todo bloco precisa de tradução
+  local missing="" missing_count=0 last_lote=0
+  for (( i=0; i<total_blocks; i++ )); do
+    if [[ -z "${TRANSLATED_TEXTS[$i]:-}" ]]; then
+      missing_count=$((missing_count + 1))
+      local lote=$(( i / LOTE_SIZE + 1 ))
+      if (( lote != last_lote )); then
+        missing="${missing}$(printf '\n  lote_%03d.txt:' "$lote")"
+        last_lote=$lote
+      fi
+      missing="${missing} $((i + 1))"
+    fi
+  done
+
+  if (( missing_count > 0 )); then
+    echo "ERRO: $missing_count bloco(s) sem tradução:${missing}"
+    exit 2
+  fi
+
+  write_srt "$SRT_PTBR"
+  rm -rf "$workdir"
+  echo "OK: $SRT_PTBR ($total_blocks blocos)"
+}
+
+# ─── Entrada ────────────────────────────────────────────────────
+case "${1:-}" in
+  prepare) shift; cmd_prepare "$@" ;;
+  finish)  shift; cmd_finish "$@" ;;
+  *)       main_api "$@" ;;
+esac
