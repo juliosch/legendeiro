@@ -1,28 +1,52 @@
 # Legendeiro
 
-Script bash para extrair legendas de arquivos MKV e localizá-las para português brasileiro (PT-BR) usando LLMs.
+Gera legendas em português brasileiro (`.pt-BR.srt`) para arquivos MKV. Extrai a melhor legenda disponível no vídeo e faz uma **localização** para PT-BR: linguagem natural e coloquial, gírias adaptadas e palavrões sem censura (público 18+), não uma tradução literal.
 
-O Legendeiro prioriza legendas em línguas românicas (espanhol, francês, italiano, etc.) como fonte de tradução, pois essas línguas preservam gênero gramatical e têm proximidade lexical com o português — o que resulta em uma localização mais precisa. Inglês é usado como fallback quando nenhuma língua românica está disponível.
+Tem dois modos de uso:
 
-## Como funciona
-
-1. **Busca arquivos MKV** no caminho informado (arquivo único ou diretório recursivo)
-2. **Pula arquivos** que já possuem legenda `.pt-BR.srt`
-3. **Detecta a melhor legenda disponível**, procurando primeiro por arquivos SRT externos e depois dentro do MKV, seguindo esta ordem de prioridade:
-   - Espanhol latino > Espanhol > Português (PT) > Francês > Italiano > Romeno > Catalão > Alemão > Holandês > Russo > Polonês > Tcheco > Grego > Árabe > Inglês
-4. **Localiza as legendas** via LLM em batches, gerando um arquivo `.pt-BR.srt` ao lado do MKV original
-
-O prompt enviado ao LLM instrui uma **localização** (não apenas tradução literal), com linguagem coloquial brasileira e sem censura de palavrões (público 18+).
+- **Claude Code (recomendado):** a skill `/legendar` usa o próprio Claude Code para localizar. Não precisa de API key e mantém nomes, gênero e tratamento consistentes ao longo da série.
+- **API:** o script chama sozinho um LLM (Gemini, OpenAI, Anthropic, Groq ou Ollama) com a sua API key.
 
 ## Pré-requisitos
 
-- **bash** 3.2+
-- **ffmpeg** e **ffprobe** (para extrair legendas dos MKVs)
-- **jq** (para montar/parsear JSON)
-- **curl**
-- Uma chave de API de LLM (ver [Providers suportados](#providers-suportados))
+- **bash** 3.2+ (o do macOS serve)
+- **ffmpeg** e **ffprobe**, para extrair legendas de dentro dos MKVs
+- Modo API: **curl**, **jq** e uma API key do provider (exceto Ollama)
 
-## Uso
+## Modo Claude Code
+
+Com o Claude Code aberto na pasta do repo:
+
+```
+/legendar ~/Series/Minha.Serie/Season 1/
+/legendar video.mkv
+```
+
+O `.pt-BR.srt` é gravado ao lado de cada MKV. Para cada arquivo, a skill:
+
+1. Roda `./legendeiro.sh prepare`, que escolhe a melhor legenda de origem, extrai e divide em lotes `N|||texto`.
+2. Escreve ou reaproveita o contexto da série em `.legendeiro-work/contexto-<serie>.md`: personagens e gênero, quem trata quem por "você" ou "a senhora", tom e glossário. É isso que mantém a temporada consistente.
+3. Localiza o episódio inteiro seguindo [`.claude/skills/legendar/regras.md`](.claude/skills/legendar/regras.md). Um episódio é traduzido pela sessão principal. Numa pasta com vários episódios, cada um vai para um subagente, até 5 em paralelo.
+4. Roda `./legendeiro.sh finish`, que só grava o SRT se todos os blocos estiverem traduzidos e mantém os tempos originais.
+
+A tradução consome a cota do seu Claude Code: um episódio de uns 45 minutos tem de 700 a 900 blocos.
+
+### Comandos usados pela skill
+
+Os dois comandos não chamam nenhum LLM e também podem ser usados à mão:
+
+```bash
+./legendeiro.sh prepare video.mkv [--source-lang spa]   # imprime "WORKDIR: <caminho>"
+./legendeiro.sh finish <WORKDIR>                        # gera video.pt-BR.srt e apaga o WORKDIR
+```
+
+- `prepare` sai com **0** (pronto), **1** (já existe PT-BR, pulado) ou **2** (erro, por exemplo vídeo sem legenda).
+- O WORKDIR contém `lote_NNN.txt` (até 150 blocos cada), e as traduções vão em `lote_NNN.ptbr.txt`, no mesmo formato.
+- `finish` lista os blocos que faltam, se houver, e sai com 2 sem gravar nada.
+- O WORKDIR fica em `$TMPDIR` por padrão. Defina `LEGENDEIRO_WORK=<dir>` para mudar o local (a skill usa `.legendeiro-work/`, que está no `.gitignore`).
+- O destino do SRT fica no arquivo `meta` do WORKDIR (`SRT_PTBR=...`). Se a pasta do vídeo não aceitar gravação, como um compartilhamento de rede só leitura, aponte para outro lugar e rode `finish` de novo.
+
+## Modo API
 
 ```bash
 ./legendeiro.sh <caminho> <LLM_API_KEY> [opções]
@@ -31,96 +55,32 @@ O prompt enviado ao LLM instrui uma **localização** (não apenas tradução li
 | Argumento | Descrição |
 |-----------|-----------|
 | `caminho` | Arquivo `.mkv` ou diretório (busca recursiva) |
-| `LLM_API_KEY` | Chave da API do LLM (use `none` para Ollama) |
+| `LLM_API_KEY` | API key do provider (use `none` para Ollama) |
 
-### Opções
-
-| Flag | Descrição |
-|------|-----------|
-| `--provider P` | Provider do LLM: `gemini`, `openai`, `anthropic`, `groq`, `ollama` (padrão: `gemini`) |
-| `--model M` | Modelo específico (se omitido, usa o padrão do provider) |
-| `--source-lang X` | Forçar idioma de origem: `spa`, `eng`, `fre`, etc. (se omitido, auto-detecta) |
-
-### Exemplos
+| Opção | Descrição |
+|-------|-----------|
+| `--provider P` | `gemini`, `openai`, `anthropic`, `groq` ou `ollama` (padrão: `gemini`) |
+| `--model M` | Modelo específico (padrão: o do provider, na tabela abaixo) |
+| `--source-lang X` | Força o idioma de origem: `spa`, `eng`, `fre`... (padrão: detecta sozinho) |
 
 ```bash
-# Traduzir todos os MKVs do diretório atual
-./legendeiro.sh . SUA_GEMINI_KEY
-
-# Traduzir um arquivo específico
-./legendeiro.sh "video.mkv" SUA_GEMINI_KEY
-
-# Usar OpenAI
+./legendeiro.sh . SUA_GEMINI_KEY                                  # todos os MKVs da pasta
+./legendeiro.sh "video.mkv" SUA_GEMINI_KEY                        # um arquivo
 ./legendeiro.sh ./series/ SUA_OPENAI_KEY --provider openai
-
-# Usar Claude
-./legendeiro.sh . SUA_ANTHROPIC_KEY --provider anthropic
-
-# Usar Ollama (local, sem API key)
-./legendeiro.sh . none --provider ollama --model llama3.1
+./legendeiro.sh . none --provider ollama --model llama3.1         # local, sem key
 ```
 
-## Usando no Claude Code (sem API key)
-
-O repo inclui a skill `/legendar`: o próprio Claude Code faz a localização, então não precisa de API key. Com o Claude Code aberto nesta pasta:
-
-```
-/legendar ~/Series/Minha.Serie/S01/
-/legendar "video.mkv"
-```
-
-A skill usa o modo lotes do script, que não chama nenhum LLM:
-
-```bash
-./legendeiro.sh prepare video.mkv   # extrai a legenda e divide em lotes "N|||texto"; imprime WORKDIR
-./legendeiro.sh finish <WORKDIR>    # valida os lote_*.ptbr.txt e gera video.pt-BR.srt
-```
-
-Entre os dois passos, o Claude escreve um contexto da série em `.legendeiro-work/contexto-<serie>.md` (personagens e gênero, tom, tratamento, glossário), reaproveitado nos episódios seguintes, e localiza o episódio inteiro seguindo `.claude/skills/legendar/regras.md`. Um episódio é traduzido pela sessão principal. Numa pasta com vários episódios, cada episódio vai para um subagente, em paralelo. O `finish` não deixa passar nenhum bloco sem tradução.
-
-## Providers suportados
-
-| Provider | Modelo padrão | API Key |
-|----------|--------------|---------|
+| Provider | Modelo padrão | API key |
+|----------|---------------|---------|
 | Gemini | `gemini-2.5-flash` | [Google AI Studio](https://aistudio.google.com/apikey) |
 | OpenAI | `gpt-4o-mini` | [platform.openai.com](https://platform.openai.com/api-keys) |
 | Anthropic | `claude-sonnet-4-20250514` | [console.anthropic.com](https://console.anthropic.com/) |
 | Groq | `llama-3.3-70b-versatile` | [console.groq.com](https://console.groq.com/keys) |
 | Ollama | `llama3.1` | Nenhuma (roda local) |
 
-## Detecção de legendas
+> **Anthropic:** o modelo padrão está deprecated, e os modelos Claude mais novos ainda não funcionam neste modo (o script envia `temperature`, que eles recusam). Para usar Claude, prefira o modo Claude Code.
 
-O script busca legendas em duas fontes, nesta ordem:
-
-### 1. Arquivos SRT externos
-
-Procura na mesma pasta do MKV por arquivos com sufixos como:
-
-- `video.spa.srt`, `video.es.srt`, `video.spanish.srt`
-- `video.es-LA.srt`, `video.latino.srt`, `video.es-419.srt`
-- `video.fre.srt`, `video.fr.srt`
-- `video.eng.srt`, `video.en.srt`
-- etc.
-
-### 2. Streams dentro do MKV
-
-Extrai via `ffprobe`/`ffmpeg`, priorizando streams com título indicando espanhol latino (`Latin`, `Latino`, `LATAM`, `MX`).
-
-### Skip automático
-
-Se já existir um arquivo com qualquer um destes padrões, o script pula o arquivo:
-
-`video.pt-BR.srt`, `video.pt_BR.srt`, `video.ptbr.srt`, `video.brazilian.srt`
-
-## Por que priorizar línguas românicas?
-
-Línguas da mesma família (espanhol, francês, italiano, português de Portugal, romeno, catalão) preservam **gênero gramatical** — algo que o inglês não faz. Quando o LLM traduz "the neighbor" do inglês, não sabe se deve usar "o vizinho" ou "a vizinha". Mas a partir de "el vecino" ou "la vecina" do espanhol, a tradução é inequívoca.
-
-Além disso, línguas românicas compartilham cognatos e estruturas frasais que resultam em uma localização mais natural.
-
-## Saída
-
-O script gera um arquivo `.pt-BR.srt` no mesmo diretório do MKV original. Ao processar um diretório, exibe um resumo ao final:
+A legenda é enviada em batches de 40 blocos, com até 3 tentativas por batch. Se um batch falhar, os blocos dele ficam no idioma original. No fim de um diretório, o script mostra um resumo:
 
 ```
 ════════════════════════════════════════════════════════════
@@ -131,3 +91,17 @@ RESUMO
   Erros:      1
 ════════════════════════════════════════════════════════════
 ```
+
+## Escolha da legenda de origem
+
+Vale para os dois modos. O script procura primeiro um SRT externo na pasta do MKV e depois as faixas de legenda dentro do MKV, nesta ordem de idioma:
+
+Espanhol latino > Espanhol > Português (PT) > Francês > Italiano > Romeno > Catalão > Alemão > Holandês > Russo > Polonês > Tcheco > Grego > Árabe > Inglês
+
+- **SRT externo:** `video.<idioma>.srt`, com sufixos como `spa`, `es`, `es-419`, `latino`, `fre`, `fr`, `eng`, `en` etc. Aceita maiúsculas e minúsculas e a extensão `.SRT`.
+- **Dentro do MKV:** espanhol latino é reconhecido pelo título da faixa (`Latin`, `Latino`, `LATAM`, `MX`, `México`...). Os outros idiomas, pela tag de idioma.
+- **Pular arquivo:** o MKV é ignorado se já existir `video.<sufixo>.srt` com um destes sufixos: `pt-BR`, `pt-br`, `pt_BR`, `pt_br`, `ptbr`, `por.br` ou `brazilian`.
+
+### Por que priorizar línguas românicas?
+
+Espanhol, francês, italiano e as outras línguas românicas marcam **gênero gramatical**, e o inglês não. A partir de "the neighbor" não dá para saber se é "o vizinho" ou "a vizinha"; a partir de "el vecino" ou "la vecina", dá. Elas também compartilham cognatos e estrutura de frase com o português, o que deixa a localização mais natural. Inglês fica como último recurso.
